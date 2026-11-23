@@ -1,0 +1,294 @@
+/*
+  ESP32 Dual-Mode RFID RC Car
+  ---------------------------
+  WHITE RFID UID  = 51 E3 2E 17 -> start/enable car and remote
+  BLUE RFID UID   = D9 32 FB 05 -> stop/disable car
+
+  Modes:
+    MANUAL: drive from the web remote.
+    AUTO:   drive forward; if an obstacle is detected, turn right first.
+            If the right turn is still blocked, turn left. If left is
+            blocked too, perform a U-turn.
+
+  The ESP32 creates a Wi-Fi access point:
+    SSID: ESP32_RC_CAR
+    Password: 12345678
+    Open: http://192.168.4.1/
+
+  Libraries required from Arduino Library Manager:
+    - MFRC522 by GithubCommunity
+    - WiFi and WebServer are included with the ESP32 board package
+
+  Important:
+    HC-SR04 ECHO is 5 V. Use a voltage divider before connecting it to
+    ESP32 GPIO 27. Example: ECHO -> 1 kOhm -> GPIO27 -> 2 kOhm -> GND.
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// ---------------- Pin assignment ----------------
+// L298N motor driver
+const uint8_t ENA = 25;  // left motor speed PWM
+const uint8_t IN1 = 26;
+const uint8_t IN2 = 33;
+const uint8_t ENB = 14;  // right motor speed PWM
+const uint8_t IN3 = 12;
+const uint8_t IN4 = 13;
+
+// HC-SR04
+const uint8_t TRIG_PIN = 32;
+const uint8_t ECHO_PIN = 27;
+
+// Indicators
+const uint8_t LED_PIN = 2;
+const uint8_t BUZZER_PIN = 4;
+
+// MFRC522 SPI pins (default VSPI pins)
+const uint8_t RFID_SS_PIN = 5;
+const uint8_t RFID_RST_PIN = 22;
+const uint8_t RFID_SCK_PIN = 18;
+const uint8_t RFID_MISO_PIN = 19;
+const uint8_t RFID_MOSI_PIN = 23;
+
+MFRC522 rfid(RFID_SS_PIN, RFID_RST_PIN);
+WebServer server(80);
+
+// ---------------- User settings ----------------
+const char *AP_SSID = "ESP32_RC_CAR";
+const char *AP_PASSWORD = "12345678"; // at least 8 characters
+const int OBSTACLE_CM = 25;
+const int DEFAULT_SPEED = 190; // 0..255
+
+// The UID bytes supplied by the user
+const byte WHITE_UID[] = {0x51, 0xE3, 0x2E, 0x17};
+const byte BLUE_UID[]  = {0xD9, 0x32, 0xFB, 0x05};
+
+bool carEnabled = false;
+bool autoMode = false;
+int driveSpeed = DEFAULT_SPEED;
+String manualCommand = "stop";
+
+// ---------------- Automatic driving state ----------------
+enum AutoPhase { AUTO_DRIVE, AUTO_RIGHT, AUTO_LEFT, AUTO_UTURN };
+AutoPhase autoPhase = AUTO_DRIVE;
+unsigned long phaseStarted = 0;
+unsigned long lastDistanceRead = 0;
+long distanceCm = 999;
+
+// ---------------- Web page ----------------
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 RC Car</title>
+<style>
+:root{font-family:Arial,sans-serif;color:#eaf2ff;background:#101827}body{max-width:500px;margin:auto;padding:18px}
+.card{background:#1b2940;border-radius:18px;padding:18px;margin-bottom:14px;box-shadow:0 5px 18px #0005}
+h1{font-size:25px;margin:0 0 10px}.status{font-size:16px;line-height:1.7}.on{color:#63f59b}.off{color:#ff7070}
+select,input{width:100%;padding:12px;margin:8px 0;border:0;border-radius:10px;font-size:16px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:12px}.grid button,.stop{min-height:60px;border:0;border-radius:14px;background:#2e84ff;color:white;font-size:25px;font-weight:bold}.stop{width:100%;background:#e34f58;margin-top:10px;font-size:18px}.hint{font-size:13px;color:#b5c4d8}
+</style></head><body>
+<div class="card"><h1>ESP32 RFID RC Car</h1><div id="status" class="status">Loading...</div></div>
+<div class="card"><label>Driving mode</label><select id="mode" onchange="setMode(this.value)"><option value="manual">Manual</option><option value="auto">Automatic</option></select>
+<label>Motor speed: <span id="sv">190</span></label><input id="speed" type="range" min="80" max="255" value="190" oninput="document.getElementById('sv').innerText=this.value" onchange="setSpeed(this.value)">
+<div class="hint">Manual buttons are active only after the white RFID card enables the car.</div></div>
+<div class="card"><div class="grid"><span></span><button onpointerdown="hold('forward')" onpointerup="release()" onpointerleave="release()">▲</button><span></span>
+<button onpointerdown="hold('left')" onpointerup="release()" onpointerleave="release()">◀</button><button onclick="send('stop')">■</button><button onpointerdown="hold('right')" onpointerup="release()" onpointerleave="release()">▶</button>
+<span></span><button onpointerdown="hold('reverse')" onpointerup="release()" onpointerleave="release()">▼</button><span></span></div><button class="stop" onclick="send('stop')">EMERGENCY STOP</button></div>
+<script>
+let timer;const q=x=>document.getElementById(x);
+function send(m){fetch('/cmd?move='+m).catch(()=>{});}
+function hold(m){send(m);clearInterval(timer);timer=setInterval(()=>send(m),250)}
+function release(){clearInterval(timer);send('stop')}
+function setMode(m){fetch('/mode?value='+m)} function setSpeed(v){fetch('/speed?value='+v)}
+async function update(){try{let s=await (await fetch('/status')).json();q('status').innerHTML=`Power: <b class="${s.enabled?'on':'off'}">${s.enabled?'ON':'OFF'}</b><br>Mode: <b>${s.mode}</b><br>Distance: <b>${s.distance} cm</b><br>Obstacle: <b>${s.obstacle?'YES':'NO'}</b><br>Wi-Fi IP: <b>${s.ip}</b>`;q('mode').value=s.mode;q('speed').value=s.speed;q('sv').innerText=s.speed}catch(e){q('status').innerText='Disconnected'}}setInterval(update,700);update();
+</script></body></html>
+)rawliteral";
+
+// ---------------- Motor functions ----------------
+void setMotor(uint8_t inA, uint8_t inB, uint8_t en, int speedValue) {
+  speedValue = constrain(speedValue, -255, 255);
+  if (speedValue > 0) { digitalWrite(inA, HIGH); digitalWrite(inB, LOW); }
+  else if (speedValue < 0) { digitalWrite(inA, LOW); digitalWrite(inB, HIGH); }
+  else { digitalWrite(inA, LOW); digitalWrite(inB, LOW); }
+  analogWrite(en, abs(speedValue));
+}
+
+void stopMotors() {
+  setMotor(IN1, IN2, ENA, 0);
+  setMotor(IN3, IN4, ENB, 0);
+}
+
+void driveForward() { setMotor(IN1, IN2, ENA, driveSpeed); setMotor(IN3, IN4, ENB, driveSpeed); }
+void driveReverse() { setMotor(IN1, IN2, ENA, -driveSpeed); setMotor(IN3, IN4, ENB, -driveSpeed); }
+void turnLeft() { setMotor(IN1, IN2, ENA, -driveSpeed); setMotor(IN3, IN4, ENB, driveSpeed); }
+void turnRight() { setMotor(IN1, IN2, ENA, driveSpeed); setMotor(IN3, IN4, ENB, -driveSpeed); }
+
+// ---------------- Sensor and RFID functions ----------------
+long readDistanceCm() {
+  digitalWrite(TRIG_PIN, LOW); delayMicroseconds(3);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10); digitalWrite(TRIG_PIN, LOW);
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 25000UL);
+  if (duration == 0) return 999;
+  return (long)(duration * 0.0343 / 2.0);
+}
+
+bool sameUid(const byte *wanted, byte wantedLength) {
+  if (rfid.uid.size != wantedLength) return false;
+  for (byte i = 0; i < wantedLength; i++) if (rfid.uid.uidByte[i] != wanted[i]) return false;
+  return true;
+}
+
+void handleRFID() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  if (sameUid(WHITE_UID, sizeof(WHITE_UID))) {
+    carEnabled = true;
+    digitalWrite(LED_PIN, HIGH);
+    manualCommand = "stop";
+    autoPhase = AUTO_DRIVE;
+  } else if (sameUid(BLUE_UID, sizeof(BLUE_UID))) {
+    carEnabled = false;
+    digitalWrite(LED_PIN, LOW);
+    manualCommand = "stop";
+    stopMotors();
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+// ---------------- Buzzer and movement logic ----------------
+void updateBuzzer() {
+  static unsigned long lastBeep = 0;
+  static bool beepOn = false;
+  bool obstacle = (distanceCm <= OBSTACLE_CM);
+  if (!carEnabled || !obstacle) { digitalWrite(BUZZER_PIN, LOW); beepOn = false; return; }
+  if (millis() - lastBeep >= 180) {
+    lastBeep = millis(); beepOn = !beepOn; digitalWrite(BUZZER_PIN, beepOn ? HIGH : LOW);
+  }
+}
+
+void beginAvoidance() {
+  stopMotors();
+  autoPhase = AUTO_RIGHT;
+  phaseStarted = millis();
+}
+
+void runAutoMode() {
+  if (!carEnabled) { stopMotors(); return; }
+
+  if (millis() - lastDistanceRead >= 80) {
+    lastDistanceRead = millis();
+    distanceCm = readDistanceCm();
+  }
+
+  switch (autoPhase) {
+    case AUTO_DRIVE:
+      if (distanceCm <= OBSTACLE_CM) beginAvoidance();
+      else driveForward();
+      break;
+
+    case AUTO_RIGHT:
+      turnRight();
+      // Give the car time to rotate, then check whether the new direction is free.
+      if (millis() - phaseStarted >= 450) {
+        distanceCm = readDistanceCm();
+        if (distanceCm > OBSTACLE_CM) autoPhase = AUTO_DRIVE;
+        else { autoPhase = AUTO_LEFT; phaseStarted = millis(); }
+      }
+      break;
+
+    case AUTO_LEFT:
+      // 900 ms left after 450 ms right gives an approximately left-facing heading.
+      turnLeft();
+      if (millis() - phaseStarted >= 900) {
+        distanceCm = readDistanceCm();
+        if (distanceCm > OBSTACLE_CM) autoPhase = AUTO_DRIVE;
+        else { autoPhase = AUTO_UTURN; phaseStarted = millis(); }
+      }
+      break;
+
+    case AUTO_UTURN:
+      turnLeft();
+      if (millis() - phaseStarted >= 1000) autoPhase = AUTO_DRIVE;
+      break;
+  }
+}
+
+void runManualMode() {
+  if (!carEnabled) { stopMotors(); return; }
+  // A forward command is stopped if the ultrasonic sensor sees an obstacle.
+  if (manualCommand == "forward" && distanceCm <= OBSTACLE_CM) stopMotors();
+  else if (manualCommand == "forward") driveForward();
+  else if (manualCommand == "reverse") driveReverse();
+  else if (manualCommand == "left") turnLeft();
+  else if (manualCommand == "right") turnRight();
+  else stopMotors();
+}
+
+// ---------------- Web server handlers ----------------
+void sendStatus() {
+  String json = "{\"enabled\":" + String(carEnabled ? "true" : "false") +
+    ",\"mode\":\"" + String(autoMode ? "auto" : "manual") +
+    "\",\"distance\":" + String(distanceCm) +
+    ",\"obstacle\":" + String(distanceCm <= OBSTACLE_CM ? "true" : "false") +
+    ",\"speed\":" + String(driveSpeed) +
+    ",\"ip\":\"" + WiFi.softAPIP().toString() + "\"}";
+  server.send(200, "application/json", json);
+}
+
+void setupWebServer() {
+  server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", INDEX_HTML); });
+  server.on("/status", HTTP_GET, sendStatus);
+  server.on("/cmd", HTTP_GET, []() {
+    if (server.hasArg("move")) {
+      String m = server.arg("move");
+      if (m == "forward" || m == "reverse" || m == "left" || m == "right" || m == "stop") manualCommand = m;
+    }
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/mode", HTTP_GET, []() {
+    if (server.hasArg("value")) autoMode = server.arg("value") == "auto";
+    manualCommand = "stop"; stopMotors(); autoPhase = AUTO_DRIVE;
+    server.send(200, "text/plain", "OK");
+  });
+  server.on("/speed", HTTP_GET, []() {
+    if (server.hasArg("value")) driveSpeed = constrain(server.arg("value").toInt(), 80, 255);
+    server.send(200, "text/plain", "OK");
+  });
+  server.begin();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); pinMode(ENA, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT); pinMode(ECHO_PIN, INPUT);
+  pinMode(LED_PIN, OUTPUT); pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW); digitalWrite(BUZZER_PIN, LOW); stopMotors();
+
+  SPI.begin(RFID_SCK_PIN, RFID_MISO_PIN, RFID_MOSI_PIN, RFID_SS_PIN);
+  rfid.PCD_Init();
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  setupWebServer();
+  Serial.println("RC car ready. Connect to ESP32_RC_CAR and open http://192.168.4.1/");
+}
+
+void loop() {
+  server.handleClient();
+  handleRFID();
+
+  if (millis() - lastDistanceRead >= 80) {
+    lastDistanceRead = millis();
+    distanceCm = readDistanceCm();
+  }
+  updateBuzzer();
+
+  if (autoMode) runAutoMode();
+  else runManualMode();
+  delay(5);
+}

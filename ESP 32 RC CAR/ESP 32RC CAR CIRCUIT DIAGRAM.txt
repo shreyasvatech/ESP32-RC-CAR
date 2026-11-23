@@ -1,0 +1,92 @@
+=====================================================================
+  ESP32 RC CAR - CIRCUIT DIAGRAM (matches the code pin-for-pin)
+=====================================================================
+
+ GPIO QUICK CHECK (same numbers as the code constants)
+ -----------------------------------------------------
+   GPIO2  LED            GPIO4  BUZZER           GPIO5  RFID SDA (SS)
+   GPIO12 L298N IN3      GPIO13 L298N IN4        GPIO14 L298N ENB
+   GPIO18 RFID SCK       GPIO19 RFID MISO        GPIO22 RFID RST
+   GPIO23 RFID MOSI      GPIO25 L298N ENA        GPIO26 L298N IN1
+   GPIO27 HC-SR04 ECHO   GPIO32 HC-SR04 TRIG     GPIO33 L298N IN2
+
+
+ STEP 1 - POWER
+ --------------
+   Battery (+) 7.4-12V ----> L298N +12V terminal (motor supply)
+   Battery (-)         ----> L298N GND terminal
+   L298N 5V output     ----> ESP32 VIN
+                       ----> HC-SR04 VCC
+   COMMON GND: battery (-), L298N GND, ESP32 GND, HC-SR04 GND,
+               MFRC522 GND, LED (-), BUZZER (-) all joined together
+
+
+ STEP 2 - ESP32 TO L298N (control signals)
+ -----------------------------------------
+   ESP32 GPIO25 ----> L298N ENA   (left motor speed, PWM)
+   ESP32 GPIO26 ----> L298N IN1   (left motor direction)
+   ESP32 GPIO33 ----> L298N IN2   (left motor direction)
+   ESP32 GPIO14 ----> L298N ENB   (right motor speed, PWM)
+   ESP32 GPIO12 ----> L298N IN3   (right motor direction)
+   ESP32 GPIO13 ----> L298N IN4   (right motor direction)
+
+
+ STEP 3 - L298N TO DC MOTORS
+ ---------------------------
+   (Code assumes LEFT = OUT1/OUT2, RIGHT = OUT3/OUT4)
+   L298N OUT1 ----> LEFT motor wire 1
+   L298N OUT2 ----> LEFT motor wire 2
+   L298N OUT3 ----> RIGHT motor wire 1
+   L298N OUT4 ----> RIGHT motor wire 2
+
+
+ STEP 4 - HC-SR04 ULTRASONIC SENSOR (front of car)
+ -------------------------------------------------
+   HC-SR04 VCC  ----> 5V (L298N 5V output)
+   HC-SR04 GND  ----> common GND
+   HC-SR04 TRIG ----> ESP32 GPIO32            (direct connection)
+   HC-SR04 ECHO ----> R1 1 kOhm ----+----> ESP32 GPIO27
+                                    |
+                                  R2 2 kOhm
+                                    |
+                                   GND
+   (R1/R2 voltage divider lowers the 5V echo to about 3.3V)
+
+
+ STEP 5 - MFRC522 RFID READER (SPI, 3.3V ONLY)
+ ---------------------------------------------
+   MFRC522 3.3V ----> ESP32 3V3
+   MFRC522 GND  ----> common GND
+   MFRC522 SDA  ----> ESP32 GPIO5    (chip select, labelled SS)
+   MFRC522 SCK  ----> ESP32 GPIO18
+   MFRC522 MOSI ----> ESP32 GPIO23
+   MFRC522 MISO ----> ESP32 GPIO19
+   MFRC522 RST  ----> ESP32 GPIO22
+   MFRC522 IRQ  ----> not connected
+
+
+ STEP 6 - INDICATORS
+ -------------------
+   ESP32 GPIO2 ----> 220 ohm ----> LED (+)     LED (-) ----> GND
+   ESP32 GPIO4 ----> BUZZER (+)                BUZZER (-) ----> GND
+   - LED: skip if your board already has a built-in LED on GPIO2.
+   - BUZZER: must be an ACTIVE buzzer (a passive one only clicks).
+
+
+ IMPORTANT NOTES
+ ---------------
+ 1. Remove the ENA and ENB jumper caps on the L298N. The code sets
+    speed with PWM on those pins. With the caps in place, the motors
+    run at full speed regardless of the code.
+ 2. Keep the L298N 5V jumper ON only if the battery is 12V or less.
+    If the ESP32 resets when the motors start, power the ESP32 from a
+    separate 5V supply (power bank or buck converter) instead of VIN.
+    Still connect all GNDs together.
+ 3. The MFRC522 runs on 3.3V only. Connecting 5V can damage it.
+ 4. Never connect HC-SR04 ECHO directly to GPIO27. Use the divider.
+ 5. GPIO12 (IN3) is a boot-strapping pin. If the ESP32 fails to boot,
+    disconnect the IN3 wire, power up, then reconnect it.
+ 6. If a motor spins the wrong way, swap that motor's two wires on
+    the L298N OUT pins. Do not change the code for this.
+ 7. Every GND must be connected together. A missing common GND causes
+    erratic behavior.
